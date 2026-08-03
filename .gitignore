@@ -1,0 +1,5 @@
+checkpoints/
+data/
+tokenizers/
+
+__pycache__/
