@@ -3,7 +3,7 @@ from torch import nn
 import math
 
 class RoPE(nn.Module):
-    def __init__(self, d_head, max_context_size, base_freq=1024):
+    def __init__(self, d_head, max_context_size, base_freq=8192):
         super(RoPE, self).__init__()
 
         self.d_head = d_head

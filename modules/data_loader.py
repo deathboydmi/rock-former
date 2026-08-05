@@ -14,8 +14,10 @@ class DataLoader():
                  random_seed:int
                                     ):
         file_dir = pathlib.Path(text_file).parent
-        if file_dir.joinpath(text_file + ".pt").exists():
-            data = torch.load(text_file + ".pt")
+        file_name = pathlib.Path(text_file).name
+
+        if file_dir.joinpath(file_name + ".pt").exists():
+            data = torch.load(file_dir.joinpath(file_name + ".pt"))
         else:
             text_corpus = None
             with open(text_file, 'r', encoding='utf-8') as f:
@@ -52,7 +54,11 @@ class DataLoader():
             start = i * part_length
             end = (i + 1) * part_length if i < parts_num - 1 else len(text)
             part = text[start:end]
-            total_encoded += tokenizer_model.encode_as_ids(part)
+            total_encoded += tokenizer_model.encode(part,
+                                                    out_type=int,
+                                                    add_bos=True,
+                                                    add_eos=True
+                                                    )
         return total_encoded
 
     def train_data(self, batch_size: int):
