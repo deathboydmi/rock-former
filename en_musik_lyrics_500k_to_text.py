@@ -13,17 +13,18 @@ df = pd.concat([pd.read_csv(original_data_train), pd.read_csv(original_data_val)
 
 print(df.columns)
 print(set(df.genre))
+
 df = df[['genre', 'Lyric']].dropna()
-# df = df.where((df.genre == 'rock').Lyric.dropna()
+df = df.where((df.genre == 'rock') | (df.genre == 'Metal')).Lyric.dropna()
 
-lyrics = df.Lyric.to_list()
-genres = df.genre.to_list()
+lyrics = df.to_list()
+# genres = df.genre.to_list()
 
-assert len(lyrics) == len(genres), "Lyrics and genres lists must be of the same length."
+# assert len(lyrics) == len(genres), "Lyrics and genres lists must be of the same length."
 
 text_corpus = "\n".join(lyrics)
 
-text_file_path = './data/en_musik_500k.txt'
+text_file_path = './data/en_musik_500k_rock_metal.txt'
 with open(text_file_path, "w") as f:
     f.write(text_corpus)
 

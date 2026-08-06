@@ -9,6 +9,8 @@ import pathlib
 from modules.rockformer import Rockformer
 from modules.data_loader import DataLoader
 
+from scripts.generate import sampling, generate
+
 
 vocab_size = 16384
 embed_size = 512
@@ -17,21 +19,23 @@ ff_size = 2048
 num_blocks = 8
 max_context_size = 2048
 
-context_size = 512
-batch_size = 32
+context_size = 2048
+batch_size = 4
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 tokenizer_model_path = './tokenizers/tiny_stories_en_musik_mix.model'
-text_path = './data/tiny_stories.txt'
+text_path = './data/en_musik_500k_rock_metal.txt'
 checkpoint_path_pattern = "./checkpoints/checkpoint_step_{0:03d}.pt"
 
-FINE_TUNING = False
-pre_trained_model_path = "./checkpoints/tiny_stories/checkpoint_epoch_010.pt"
+FINE_TUNING = True
+pre_trained_model_path = "./checkpoints/en_musik_500k/checkpoint_step_40000.pt"
 
-epochs = 10
+epochs = 1
 print_every_step = 500
 eval_every_step = 10000
 generate_every_step = 5000
+
+generation_prompt = "Should I sing a hardcore song?"
 
 random_seed = 777
 torch.manual_seed(random_seed)
@@ -52,7 +56,7 @@ model.compile()
 print("Initializing optimizer and loss function...")
 optimizer = torch.optim.AdamW(
             model.parameters(),
-            lr=0.0003,
+            lr=0.0001,
             betas=(0.9, 0.95),
             eps=1e-8,
             weight_decay=0.1
@@ -82,9 +86,9 @@ total_steps = len(train_data) * epochs
 print(f"\tTotal training steps: {total_steps}")
 print(f"\tTotal processed tokens number: {total_steps * batch_size * context_size}")
 
-warmup_steps = 1000
+warmup_steps = 0
 min_lr = 3e-5
-max_lr = 3e-4
+max_lr = 1e-4
 min_factor = min_lr / max_lr
 def lr_schedule(step):
     global warmup_steps, total_steps, min_factor
@@ -102,7 +106,7 @@ scheduler = torch.optim.lr_scheduler.LambdaLR(
 )
 
 checkpoints_dir = pathlib.Path("checkpoints")
-checkpoints = list(checkpoints_dir.glob("checkpoint_epoch_*.pt"))
+checkpoints = list(checkpoints_dir.glob("checkpoint_step_*.pt"))
 if checkpoints:
     print("Loading checkpoint...")
     latest_checkpoint = max(checkpoints, key=lambda x: int(x.stem.split("_")[-1]))
@@ -110,10 +114,10 @@ if checkpoints:
     model.load_state_dict(checkpoint["model_state_dict"])
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-    start_epoch = checkpoint["epoch"] + 1
-    print(f"Resuming from epoch {start_epoch}...")
+    start_step = checkpoint["step"] + 1
+    print(f"Resuming from step {start_step}...")
 else:
-    start_epoch = 0
+    start_step = 0
 
 
 def evaluate(model, eval_data):
@@ -131,45 +135,11 @@ def evaluate(model, eval_data):
     val_avg_loss = sum(losses)/len(losses)
     return val_avg_loss
 
-def sampling(logits, temperature=1, p=0.5):
-    logits = logits / temperature
-    sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-
-    sorted_probs = torch.softmax(sorted_logits, dim=-1)
-    cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
-
-    remove = cumulative_probs > p
-    remove[1:] = remove[:-1].clone()
-    remove[0] = False
-
-    sorted_logits[remove] = -torch.inf
-
-    probs = torch.softmax(sorted_logits, dim=-1)
-
-    sampled = torch.multinomial(probs, 1)
-
-    return sorted_indices[sampled]
-
-def generate(model, sp_model, initial_str, device, max_len=512):
-    print(f"\tGenerating text with initial string: {initial_str}")
-    model = model.eval()
-    initial_ids = sp_model.encode_as_ids(initial_str)
-    initial_ids = torch.tensor(initial_ids).unsqueeze(0).to(device)
-    with torch.no_grad():
-        for _ in range(512 - len(initial_str)):
-            last_token_logits = model(initial_ids)[0][-1]
-            new_token_id = sampling(last_token_logits).unsqueeze(0).to(device)
-            initial_ids = torch.cat((initial_ids, new_token_id), dim=-1)
-
-    generated_ids = initial_ids.cpu().tolist()[0]
-    generated_text = sp_model.decode_ids(generated_ids)
-    return generated_text
-
 
 def log_statistics(step, train_avg_loss, val_avg_loss):
     print()
-    print("step", "avg eval loss", "avg train loss", sep="\t|\t")
-    print(f"{step:6d}\t|\t{val_avg_loss:.4f}\t\t|\t{train_avg_loss:.4f}")
+    print("step\t\t|\tavg eval loss", "avg train loss", sep="\t|\t")
+    print(f"{step:7d}\t|\t{val_avg_loss:.4f}\t\t|\t{train_avg_loss:.4f}")
     print()
 
 
@@ -177,9 +147,11 @@ def save_checkpoint(model,
                     optimizer,
                     scheduler,
                     step,
-                    train_avg_loss,
-                    val_avg_loss,
+                    all_train_avg_losses,
+                    all_val_avg_losses,
                     checkpoint_path_pattern):
+    train_avg_loss, val_avg_loss = all_train_avg_losses[-1], all_val_avg_losses[-1]
+
     log_statistics(step, train_avg_loss, val_avg_loss)
 
     checkpoint = {
@@ -190,8 +162,9 @@ def save_checkpoint(model,
         }
 
     torch.save(checkpoint, checkpoint_path_pattern.format(step))
-    if train_avg_loss < val_avg_loss:
+    if train_avg_loss < val_avg_loss and val_avg_loss == min(all_val_avg_losses):
         torch.save(checkpoint, "./checkpoints/best_model.pt")
+
 
 all_train_avg_losses = []
 all_val_avg_losses = []
@@ -200,7 +173,7 @@ print("Starting training...")
 start_time = time()
 train_losses = []
 train_epoch_average_losses = []
-for i, (x, y) in enumerate(train_data * epochs):
+for i, (x, y) in zip(range(start_step, total_steps), train_data * epochs):
     model = model.train()
 
     with torch.autocast("cuda", dtype=torch.bfloat16):
@@ -222,10 +195,10 @@ for i, (x, y) in enumerate(train_data * epochs):
         train_losses.clear()
         train_epoch_average_losses.append(train_average_loss)
 
-        print(f"\ttraining loss {i:5d}/{len(train_data)}: {train_average_loss:.5f} | lr: {scheduler.get_last_lr()[0]:.5f} | avg time latency: {(time() - start_time)/print_every_step:.2f}s")
+        print(f"\ttraining loss {i:7d}/{total_steps}: {train_average_loss:.5f} | lr: {scheduler.get_last_lr()[0]:.5f} | avg time latency: {(time() - start_time)/print_every_step:.2f}s")
         start_time = time()
 
-    if i % eval_every_step == 0 and i > 0:
+    if i % eval_every_step == 0 and i > 0 or i == (total_steps - 1):
         val_avg_loss = evaluate(model, eval_data)
         all_val_avg_losses.append(val_avg_loss)
 
@@ -233,11 +206,11 @@ for i, (x, y) in enumerate(train_data * epochs):
         train_epoch_average_losses.clear()
         all_train_avg_losses.append(train_avg_loss)
 
-        save_checkpoint(model, optimizer, scheduler, i, train_avg_loss, val_avg_loss, checkpoint_path_pattern)
+        save_checkpoint(model, optimizer, scheduler, i, all_train_avg_losses, all_val_avg_losses, checkpoint_path_pattern)
 
-    if i % (generate_every_step) == 0 and i > 0:
-        generated_text = generate(model, sp_model,
-                                  "Once upon a time, there was an old man called Slasher",
+    if i % (generate_every_step) == 0 and i > 0 or i == (total_steps - 1):
+        generated_text = generate(model.eval(), sp_model,
+                                  generation_prompt,
                                   device, max_len=512)
         print(f"\tGenerated text:\n{generated_text}\n")
 

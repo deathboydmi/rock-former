@@ -15,16 +15,16 @@ class RoPE(nn.Module):
         self.register_buffer("cos", torch.cos(angle), persistent=False)
         self.register_buffer("sin", torch.sin(angle), persistent=False)
 
-    def forward(self, x):
-        s = x.size(-2) # context size
+    def forward(self, x: torch.Tensor, offset=0) -> torch.Tensor:
+        s = x.size(-2)
         d = self.d_head
 
         x_ = x.view(*x.shape[:-1], d // 2, 2)
         x1 = x_[..., 0]
         x2 = x_[..., 1]
 
-        cos = self.cos[:s].to(dtype=x.dtype, device=x.device)
-        sin = self.sin[:s].to(dtype=x.dtype, device=x.device)
+        cos = self.cos[offset:offset+s].to(dtype=x.dtype, device=x.device)
+        sin = self.sin[offset:offset+s].to(dtype=x.dtype, device=x.device)
 
         y1 = x1 * cos - x2 * sin
         y2 = x1 * sin + x2 * cos
@@ -47,10 +47,15 @@ class Attention(nn.Module):
 
         self.register_buffer("mask", torch.triu(torch.full((max_context_size, max_context_size), -torch.inf), 1), persistent=False)
 
+        self.reset_kv_cache()
 
-    def forward(self, x: torch.Tensor):
+
+    def forward(self, x: torch.Tensor, use_kv_cache: bool):
         if x.size(1) > self.max_context_size:
             raise ValueError(f"Input sequence length {x.size(1)} exceeds maximum context size {self.max_context_size}")
+
+        if use_kv_cache and self.kv_cache_initialised:
+            return self.forward_kv_cache(x[:, -1:, ...])
 
         x_ = self.qkv_linear(x)
 
@@ -60,10 +65,60 @@ class Attention(nn.Module):
 
         q, k = self.rope(q), self.rope(k)
 
+        if use_kv_cache:
+            self.update_kv_cache(k.detach(), v.detach())
+            self.kv_cache_initialised = True
+
         s = q @ k.transpose(-1, -2) / math.sqrt(self.head_size)
 
         mask = self.mask[:x.size(1), :x.size(1)].to(dtype=x.dtype, device=x.device)
         s += mask
+        s = torch.softmax(s, -1)
+        # DROPOUT
+        a = s @ v
+        a = a.transpose(1,2).reshape_as(x)
+
+        y = self.heads_fuser(a)
+
+        return y
+
+    def update_kv_cache(self, k: torch.Tensor, v: torch.Tensor):
+        assert k.shape == v.shape
+
+        current_context_size = k.size(2)
+        if current_context_size >= self.max_context_size:
+            offset = current_context_size - self.max_context_size + 1
+
+            self.k_cache, self.v_cache = k[:,:,offset:,...], v[:,:,offset:,...]
+        else:
+            self.k_cache, self.v_cache = k, v
+
+    def reset_kv_cache(self):
+        self.k_cache = None
+        self.v_cache = None
+        self.kv_cache_initialised = False
+
+
+    def forward_kv_cache(self, x: torch.Tensor):
+        assert not self.training
+        qkv_last_token = self.qkv_linear(x)
+
+        qkv_last_token = qkv_last_token.view(*qkv_last_token.shape[:2], 3, self.num_heads, self.head_size).transpose(1, 3)
+        q_last_token, k_last_token, v_last_token = qkv_last_token.unbind(dim=2) # shape [batch_size, num_heads, 1, head_size]
+
+        k_context = self.k_cache # shape [batch_size, num_heads, current_context_length, head_size]
+        v_context = self.v_cache
+
+        prev_context_size = k_context.size(-2)
+        q_last_token, k_last_token = self.rope(q_last_token, prev_context_size), self.rope(k_last_token, prev_context_size)
+
+        k = torch.cat((k_context, k_last_token), dim=2)
+        v = torch.cat((v_context, v_last_token), dim=2)
+
+        self.update_kv_cache(k, v)
+
+        s = q_last_token @ k.transpose(-1, -2) / math.sqrt(self.head_size)
+
         s = torch.softmax(s, -1)
         # DROPOUT
         a = s @ v
@@ -125,9 +180,11 @@ class AttentionBlock(nn.Module):
         self.post_norm = nn.RMSNorm(embed_size)
         self.swiglu = SwiGLU(embed_size, ff_hidden_layer_size)
 
+    def reset_kv_cache(self):
+        self.attention.reset_kv_cache()
 
-    def forward(self, x: torch.Tensor):
-        y = self.attention(self.pre_norm(x))
+    def forward(self, x: torch.Tensor, use_kv_cache: bool):
+        y = self.attention(self.pre_norm(x), use_kv_cache)
         y = self.swiglu(self.post_norm(x + y))
         return x + y
 
@@ -138,9 +195,13 @@ class AttentionBlocksStack(nn.Module):
 
         self.atten_blocks = nn.ModuleList([AttentionBlock(embed_size, max_context_size, num_heads, ff_hidden_layer_size) for _ in range(blocks_number)])
 
-    def forward(self, x: torch.Tensor):
+    def reset_kv_cache(self):
         for atten_block in self.atten_blocks:
-            x = atten_block(x)
+            atten_block.reset_kv_cache()
+
+    def forward(self, x: torch.Tensor, use_kv_cache: bool = False):
+        for atten_block in self.atten_blocks:
+            x = atten_block(x, use_kv_cache)
 
         return x
 
@@ -168,11 +229,37 @@ class Rockformer(nn.Module):
         self.reverse_embed.weight = self.embed.weight
 
         self.seq = nn.Sequential(
-                                    self.embed,
-                                    self.atten_blocks,
-                                    self.post_norm,
-                                    self.reverse_embed
-                                )
+                            self.embed,
+                            self.atten_blocks,
+                            self.post_norm,
+                            self.reverse_embed
+                        )
+
+        self.max_context_size = max_context_size
+        self.__generation = False
+
+    def reset_generation(self):
+        self.atten_blocks.reset_kv_cache()
+
+    def generation(self):
+        super().eval()
+        self.__generation = True
+        return self
+
+    def train(self, mode = True):
+        self.__generation = False
+        return super().train(mode)
+
+    def eval(self):
+        return self.train(mode=False)
 
     def forward(self, x):
-        return self.seq(x)
+        # legacy
+        if not self.__generation:
+            return self.seq(x)
+
+        x_ = self.embed(x)
+        x_ = self.atten_blocks(x_, use_kv_cache=self.__generation)
+        x_ = self.post_norm(x_)
+        logits = self.reverse_embed(x_)
+        return logits
